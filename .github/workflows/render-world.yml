@@ -1,0 +1,1151 @@
+name: Render world
+
+# Renders a Minecraft world into a BlueMap map entirely on GitHub's runners. Nothing is
+# installed locally and no Java is needed on the machine that starts the run.
+#
+# When the world is too big for one job, the plan step splits it across a matrix and a
+# merge job puts the pieces back together. The interesting parts of that split live in
+# design/packages/render-actions, under test, rather than in this file; see
+# docs/render-in-actions.md for why the split is where it is and what makes it safe.
+#
+# When the world is too big for one *matrix* - more than 256 shards - the shards are
+# rendered in sequential waves, each wave a matrix of at most 256 and each waiting for
+# the one before it. Nothing is truncated to fit. Every shard caches its own render
+# state and writes a completion marker, so re-dispatching this workflow skips the shards
+# that are already done and renders only the rest: a run that dies in wave 7 costs wave
+# 7 and not the waves before it. See docs/resumable-renders.md.
+#
+# When the merged map is too large for one runner's disk, the merge becomes a tree: each
+# group of shards merges its own share, hires tiles are final at that point because they
+# are disjoint across the whole plan, and only the lowres layers travel to a final job
+# that composites them. The map then ships as parts, and the run summary says so.
+#
+# The plan step also estimates how much free disk a job needs - fetching a split-archive
+# world can briefly hold three copies of it at once, and a shard's render holds the world
+# plus its own share of the tiles. That estimate is checked against this runner's real,
+# measured free disk (never the published spec, which this project has already caught
+# understating a real runner by a wide margin) before any wave is dispatched, so a world
+# too large for the runners it would run on fails here with the numbers rather than partway
+# through a render. See design/packages/render-actions/src/plan/disk.ts.
+#
+# Mojang's EULA: this workflow accepts it on behalf of the repository owner, who has
+# already accepted it in the desktop application. BlueMap downloads a Minecraft client
+# jar from Mojang to get the block models and textures and cannot render a map without
+# one. https://www.minecraft.net/eula
+# A fork that does not want that sets the repository variable BLUEMAP_ACCEPT_DOWNLOAD
+# to "false", and the render will refuse the download instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      # GitHub documents a cap of TEN workflow_dispatch inputs; this file had twelve. The
+      # three location fields are one field whose meaning follows `world-source`, which
+      # leaves a slot spare - and `world-repository` below is what now occupies it. This
+      # file is therefore exactly at the cap: adding an eleventh input means folding two
+      # existing ones together first.
+      #
+      # (Being over the limit was not what made the workflow undispatchable - that was an
+      # arithmetic expression further down, see the comment on the "Say where the map went"
+      # step. It was worth fixing on its own.)
+      world-source:
+        description: Where the world comes from
+        type: choice
+        default: repository
+        options:
+          - repository
+          - url
+          - release-asset
+          - git
+      world:
+        description: >-
+          repository: path in this repo · url: link to a .zip ·
+          release-asset: asset name or glob, optionally "tag/glob" (default tag: latest) ·
+          git: branch, optionally "branch:subpath" when the world is not at the branch root
+        type: string
+        default: worlds/world
+      world-repository:
+        description: >-
+          release-asset and git only. owner/name of the repository the world lives in.
+          Blank means this repository (release-asset only - git always needs one named).
+        type: string
+        default: ''
+      dimension:
+        description: Dimension to render
+        type: choice
+        default: minecraft:overworld
+        options:
+          - minecraft:overworld
+          - minecraft:the_nether
+          - minecraft:the_end
+      map-id:
+        description: Storage id of the map (used in the output paths)
+        type: string
+        default: world
+      map-name:
+        description: Display name of the map in the webapp
+        type: string
+        default: World
+      output:
+        description: Where the rendered map goes
+        type: choice
+        default: artifact
+        options:
+          - artifact
+          - artifact-and-pages
+      budget-minutes:
+        description: Rendering minutes one job may spend before the world is split
+        type: string
+        default: '240'
+      max-jobs:
+        description: Cap on parallel render jobs (GitHub itself refuses more than 256)
+        type: string
+        default: '64'
+      force-shards:
+        description: Optional. Use exactly this many shards and skip the estimate.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-world-${{ inputs.map-id }}
+  cancel-in-progress: false
+
+# The repository owner has already accepted Mojang's EULA; a fork can set the repository
+# variable BLUEMAP_ACCEPT_DOWNLOAD to "false" and the render will refuse the client
+# download rather than accept for them. It is read into each wave call's `accept-download`
+# below rather than into a workflow-level `env`, because the `env` context is not available
+# in a job's `with:` block and a value that silently resolved to empty there would read as
+# "refuse" for a repository that had accepted.
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  # The renderer itself, built once from the vendored BlueMap sources so every shard
+  # runs the exact version this repository targets rather than whatever is newest.
+  # ---------------------------------------------------------------------------------
+  cli:
+    name: Build the BlueMap CLI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          # Matches `build-jars.yml`, which compiles at 25. See render-shard-wave.yml.
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d # v4
+
+      # Bare project paths: the vendored build declares the CLI as `:cli`, not
+      # `:implementations:cli`, and the wrong path fails with "project not found".
+      - name: Build the shadow jar
+        working-directory: vendor/BlueMap
+        run: ./gradlew --no-daemon :cli:shadowJar
+
+      - name: Collect the jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar=$(find vendor/BlueMap/implementations/cli/build/libs -maxdepth 1 -name '*-shadow.jar' -print -quit)
+          if [ -z "$jar" ]; then
+            echo "::error::the Gradle build produced no shadow jar"
+            exit 1
+          fi
+          echo "Built $jar ($(du -h "$jar" | cut -f1))"
+          mkdir -p cli-out
+          cp "$jar" cli-out/bluemap-cli.jar
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluemap-cli
+          path: cli-out/bluemap-cli.jar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------------
+  # Fetch the world, prove it is a world, measure it, and decide how many jobs it needs.
+  # ---------------------------------------------------------------------------------
+  plan:
+    name: Measure and plan
+    runs-on: ubuntu-24.04
+    outputs:
+      shard-ids: ${{ steps.plan.outputs.shard-ids }}
+      shard-count: ${{ steps.plan.outputs.shard-count }}
+      # BlueMap's own sanitized storage id (see design/packages/render-actions/src/bluemap.ts's
+      # sanitizeMapId): hyphens and anything else outside [A-Za-z0-9_] become underscores. Every
+      # path below that has to agree with what BlueMap actually wrote - the merged output
+      # directory, the published site/maps/<id>, the partial-merge staging shape - uses this
+      # rather than `inputs.map-id` directly. issue #47: a hyphenated map-id rendered
+      # correctly, but every one of those paths used the raw id and never found it.
+      map-id: ${{ steps.plan.outputs.map-id }}
+      world-dir: ${{ steps.plan.outputs.world-dir }}
+      plan-fingerprint: ${{ steps.plan.outputs.plan-fingerprint }}
+      wave-count: ${{ steps.plan.outputs.wave-count }}
+      group-count: ${{ steps.plan.outputs.group-count }}
+      group-ids: ${{ steps.plan.outputs.group-ids }}
+      single-group: ${{ steps.plan.outputs.single-group }}
+      required-disk-bytes: ${{ steps.plan.outputs.required-disk-bytes }}
+      wave1-shards: ${{ steps.plan.outputs.wave1-shards }}
+      wave1-needed: ${{ steps.plan.outputs.wave1-needed }}
+      wave2-shards: ${{ steps.plan.outputs.wave2-shards }}
+      wave2-needed: ${{ steps.plan.outputs.wave2-needed }}
+      wave3-shards: ${{ steps.plan.outputs.wave3-shards }}
+      wave3-needed: ${{ steps.plan.outputs.wave3-needed }}
+      wave4-shards: ${{ steps.plan.outputs.wave4-shards }}
+      wave4-needed: ${{ steps.plan.outputs.wave4-needed }}
+      wave5-shards: ${{ steps.plan.outputs.wave5-shards }}
+      wave5-needed: ${{ steps.plan.outputs.wave5-needed }}
+      wave6-shards: ${{ steps.plan.outputs.wave6-shards }}
+      wave6-needed: ${{ steps.plan.outputs.wave6-needed }}
+      wave7-shards: ${{ steps.plan.outputs.wave7-shards }}
+      wave7-needed: ${{ steps.plan.outputs.wave7-needed }}
+      wave8-shards: ${{ steps.plan.outputs.wave8-shards }}
+      wave8-needed: ${{ steps.plan.outputs.wave8-needed }}
+      wave9-shards: ${{ steps.plan.outputs.wave9-shards }}
+      wave9-needed: ${{ steps.plan.outputs.wave9-needed }}
+      wave10-shards: ${{ steps.plan.outputs.wave10-shards }}
+      wave10-needed: ${{ steps.plan.outputs.wave10-needed }}
+      wave11-shards: ${{ steps.plan.outputs.wave11-shards }}
+      wave11-needed: ${{ steps.plan.outputs.wave11-needed }}
+      wave12-shards: ${{ steps.plan.outputs.wave12-shards }}
+      wave12-needed: ${{ steps.plan.outputs.wave12-needed }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: design/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: design
+        run: pnpm install --frozen-lockfile
+
+      # `@worldlens/parts` is built beside the planner because the release-asset
+      # source rejoins split archives with `scripts/join-parts.mjs`, which is a thin
+      # command line over that package. The `...` suffix pulls each filter's own
+      # dependencies; `parts` is not one of the planner's, so it is named separately.
+      - name: Build the planner
+        working-directory: design
+        run: |
+          pnpm --filter "@worldlens/render-actions..." run build
+          pnpm --filter "@worldlens/parts" run build
+
+      - name: Fetch the world
+        id: fetch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.ORG_TOKEN || secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ inputs.world-source }}
+          WORLD: ${{ inputs.world }}
+          WORLD_REPOSITORY: ${{ inputs.world-repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p world-in
+          if [ -z "$WORLD" ]; then
+            echo "::error::'world' is empty. It is the path, URL or asset name to render."
+            exit 1
+          fi
+          case "$SOURCE" in
+            repository)
+              if [ ! -d "$WORLD" ]; then
+                echo "::error::No such path in this repository: $WORLD"
+                exit 1
+              fi
+              cp -r "$WORLD" world-in/
+              ;;
+            url)
+              echo "Downloading $WORLD"
+              curl -fSL --retry 3 --retry-delay 5 -o world.zip "$WORLD"
+              unzip -q world.zip -d world-in
+              ;;
+            git)
+              # A world kept as a git repository - see design/packages/app/src/main/worldrepo -
+              # is fetched with a shallow, single-branch clone: one commit's worth of tree, no
+              # history at all. That is the whole saving a plain `git clone` misses, and it is
+              # available here for free because the app only ever pushes one commit per branch.
+              #
+              # "branch" or "branch:subpath" when the world is not published at the branch's
+              # root. Colons cannot appear in a git branch name, so splitting on the first one
+              # is unambiguous - unlike a slash, which real branch names use all the time.
+              if [ -z "$WORLD_REPOSITORY" ]; then
+                echo "::error::'world-repository' is required when world-source is 'git': the owner/name the world's repository lives in."
+                exit 1
+              fi
+              slashes="$(printf '%s' "$WORLD_REPOSITORY" | tr -cd '/' | wc -c)"
+              if [ "$slashes" != "1" ] \
+                || [ "${WORLD_REPOSITORY#/}" != "$WORLD_REPOSITORY" ] \
+                || [ "${WORLD_REPOSITORY%/}" != "$WORLD_REPOSITORY" ]; then
+                echo "::error::'world-repository' must be owner/name, and was '$WORLD_REPOSITORY'."
+                exit 1
+              fi
+              case "$WORLD" in
+                *:*) BRANCH="${WORLD%%:*}"; SUBPATH="${WORLD#*:}" ;;
+                *)   BRANCH="$WORLD";       SUBPATH="" ;;
+              esac
+              if [ -z "$BRANCH" ]; then
+                echo "::error::'world' must name a branch (optionally 'branch:subpath') when world-source is 'git'."
+                exit 1
+              fi
+              echo "Cloning $WORLD_REPOSITORY at $BRANCH (shallow, single branch, no history)"
+              git -c credential.helper= -c "credential.helper=!gh auth git-credential" \
+                clone --quiet --depth 1 --single-branch --branch "$BRANCH" \
+                "https://github.com/${WORLD_REPOSITORY}.git" world-repo-in
+              SOURCE_DIR="world-repo-in"
+              if [ -n "$SUBPATH" ]; then
+                SOURCE_DIR="world-repo-in/${SUBPATH}"
+                if [ ! -d "$SOURCE_DIR" ]; then
+                  echo "::error::No such path '$SUBPATH' on branch '$BRANCH' of $WORLD_REPOSITORY."
+                  exit 1
+                fi
+              fi
+              cp -r "$SOURCE_DIR" world-in/
+              rm -rf world-repo-in
+              ;;
+            release-asset)
+              # "asset-glob", or "tag/asset-glob" to pin a release. A release asset's file
+              # name cannot contain a slash, so splitting on the LAST one is unambiguous
+              # and keeps a tag that has slashes in it - `release/1.4` - working.
+              case "$WORLD" in
+                */*) RELEASE_TAG="${WORLD%/*}"; RELEASE_ASSET="${WORLD##*/}" ;;
+                *)   RELEASE_TAG="latest";      RELEASE_ASSET="$WORLD" ;;
+              esac
+
+              # Without `--repo`, `gh release download` can only ever read a release in the
+              # repository the run is happening in. That is the whole reason this input
+              # exists: a world published by somebody else was unreachable from here, and
+              # the failure read as a missing asset rather than as a missing flag.
+              repo_flags=()
+              if [ -n "$WORLD_REPOSITORY" ]; then
+                slashes="$(printf '%s' "$WORLD_REPOSITORY" | tr -cd '/' | wc -c)"
+                if [ "$slashes" != "1" ] \
+                  || [ "${WORLD_REPOSITORY#/}" != "$WORLD_REPOSITORY" ] \
+                  || [ "${WORLD_REPOSITORY%/}" != "$WORLD_REPOSITORY" ]; then
+                  echo "::error::'world-repository' must be owner/name, and was '$WORLD_REPOSITORY'."
+                  exit 1
+                fi
+                repo_flags=(--repo "$WORLD_REPOSITORY")
+              fi
+              tag_flags=()
+              if [ "$RELEASE_TAG" != "latest" ]; then
+                tag_flags=("$RELEASE_TAG")
+              fi
+              echo "Release: $RELEASE_TAG   asset: $RELEASE_ASSET   repository: ${WORLD_REPOSITORY:-this one}"
+
+              mkdir -p release-in
+              # Everything whose name begins with the asset: the whole file when it was
+              # published whole, and every `<name>.part.NNNN` / `<name>.NNN` when it was not.
+              # The trailing `*` is what lets one input find a split and an unsplit archive
+              # alike, so nobody has to know how a stranger chose to publish theirs.
+              gh release download "${tag_flags[@]}" "${repo_flags[@]}" \
+                --pattern "${RELEASE_ASSET}*" --dir release-in --clobber
+              # The checksum list, in a call of its own. `gh` fails a download in which no
+              # pattern matched anything, and a release carrying a `.parts.json` instead has
+              # no `SHA256SUMS` at all - which is not an error.
+              gh release download "${tag_flags[@]}" "${repo_flags[@]}" \
+                --pattern 'SHA256SUMS' --dir release-in --clobber || true
+              ls -la release-in
+
+              shopt -s nullglob
+              manifests=(release-in/*.parts.json)
+              parts=(release-in/"${RELEASE_ASSET}".part.[0-9]* release-in/"${RELEASE_ASSET}".[0-9][0-9][0-9])
+              wholes=(release-in/*.zip)
+              shopt -u nullglob
+
+              archive=""
+              if [ ${#manifests[@]} -gt 0 ]; then
+                # Published the way this project publishes one. The manifest already carries
+                # a digest for every part AND one for the whole file, so nothing is derived.
+                echo "Rejoining from ${manifests[0]}"
+                node scripts/join-parts.mjs "${manifests[0]}" --out .
+                archive="$(basename "${manifests[0]}" .parts.json)"
+              elif [ ${#parts[@]} -gt 0 ]; then
+                if [ ! -f release-in/SHA256SUMS ]; then
+                  echo "::error::${RELEASE_ASSET} is published in ${#parts[@]} parts and the release carries neither SHA256SUMS nor a .parts.json. A part that arrived short produces an archive that still unzips and a world that corrupts later, so this will not be joined unverified."
+                  exit 1
+                fi
+
+                # Verified BEFORE anything is joined, against the release's own digests, by
+                # coreutils' own reader. `--strict` is what makes an unparseable line a
+                # failure rather than a skipped check; `--ignore-missing` keeps the list
+                # usable when it also names assets this render never asked for.
+                echo "Checking ${#parts[@]} parts against SHA256SUMS"
+                ( cd release-in && sha256sum --check --strict --ignore-missing SHA256SUMS )
+
+                # The join itself is `scripts/join-parts.mjs` - the same code the desktop
+                # application runs and the same code a person runs by hand - so there is
+                # exactly one joiner in this repository. It reads a `<name>.parts.json`,
+                # which a SHA256SUMS release does not publish, so one is derived here from
+                # the parts that have just been verified.
+                #
+                # The whole-file digest below is DERIVED, not published: it proves the join
+                # wrote what it read - a truncated write, a full disk - and nothing about
+                # what the publisher had. The per-part digests checked above are the only
+                # external authority, which is exactly why they are checked first.
+                width=""
+                index=0
+                expected=""
+                for part in "${parts[@]}"; do
+                  suffix="${part##*.}"
+                  if [ -z "$width" ]; then
+                    width="${#suffix}"
+                    # A run may start at 0 or at 1 - both are published and neither is wrong -
+                    # but it has to be contiguous from wherever it starts.
+                    expected=$((10#$suffix))
+                    if [ "$expected" -gt 1 ]; then
+                      echo "::error::${RELEASE_ASSET} starts at part $expected, so parts before it were never published."
+                      exit 1
+                    fi
+                  fi
+                  # Fixed-width names are what make the shell's lexicographic glob order the
+                  # numeric order. Mixed widths would sort `.999` after `.1000`, and joining
+                  # parts in the wrong order produces an archive nobody can open.
+                  if [ "${#suffix}" != "$width" ]; then
+                    echo "::error::${RELEASE_ASSET} numbers its parts with different widths, so their order cannot be read from their names."
+                    exit 1
+                  fi
+                  index=$((10#$suffix))
+                  if [ "$index" != "$expected" ]; then
+                    echo "::error::${RELEASE_ASSET} jumps to part $index where part $expected was expected; joining what is here would produce a shorter archive that still unzips."
+                    exit 1
+                  fi
+                  expected=$((expected + 1))
+                done
+
+                total_bytes=0
+                max_bytes=0
+                entries=""
+                position=0
+                for part in "${parts[@]}"; do
+                  name="$(basename "$part")"
+                  # A name carrying a quote or a backslash cannot be written into JSON here
+                  # without an escaper, and GitHub does not produce one. Refused rather than
+                  # emitted broken.
+                  case "$name" in
+                    *\"*|*\\*)
+                      echo "::error::the part name '$name' cannot be written into a manifest."
+                      exit 1
+                      ;;
+                  esac
+                  bytes="$(stat -c %s "$part")"
+                  digest="$(awk -v want="$name" '{ n = $2; sub(/^\*/, "", n); if (n == want) { print tolower($1); exit } }' release-in/SHA256SUMS)"
+                  if [ -z "$digest" ]; then
+                    echo "::error::SHA256SUMS does not list $name, so it was never verified."
+                    exit 1
+                  fi
+                  total_bytes=$((total_bytes + bytes))
+                  if [ "$bytes" -gt "$max_bytes" ]; then max_bytes="$bytes"; fi
+                  position=$((position + 1))
+                  if [ "$position" -gt 1 ]; then entries="${entries},"; fi
+                  entries="${entries}"$'\n'"        { \"index\": ${position}, \"name\": \"${name}\", \"bytes\": ${bytes}, \"sha256\": \"${digest}\" }"
+                done
+
+                whole_sha="$(cat "${parts[@]}" | sha256sum | cut -d' ' -f1)"
+                {
+                  printf '{\n'
+                  printf '    "version": 1,\n'
+                  printf '    "file": "%s",\n' "$RELEASE_ASSET"
+                  printf '    "bytes": %s,\n' "$total_bytes"
+                  printf '    "sha256": "%s",\n' "$whole_sha"
+                  printf '    "partSize": %s,\n' "$max_bytes"
+                  printf '    "parts": [%s\n' "$entries"
+                  printf '    ]\n'
+                  printf '}\n'
+                } > "release-in/${RELEASE_ASSET}.parts.json"
+                echo "Derived ${RELEASE_ASSET}.parts.json for ${#parts[@]} verified parts."
+
+                node scripts/join-parts.mjs "release-in/${RELEASE_ASSET}.parts.json" --out .
+                archive="$RELEASE_ASSET"
+              elif [ ${#wholes[@]} -gt 0 ]; then
+                archive="$(basename "${wholes[0]}")"
+                mv "${wholes[0]}" "$archive"
+              else
+                echo "::error::the release download produced neither a zip archive nor a set of parts"
+                exit 1
+              fi
+
+              if [ ! -f "$archive" ]; then
+                echo "::error::expected $archive after the download, and it is not there"
+                exit 1
+              fi
+              echo "Unpacking $archive ($(du -h "$archive" | cut -f1))"
+              unzip -q "$archive" -d world-in
+              # The parts and the joined archive both go before the render starts. A 6.6 GB
+              # world is 6.6 GB of parts plus 6.6 GB of archive plus the unpacked tree, and
+              # a runner does not have room for all three.
+              rm -rf release-in "$archive"
+              ;;
+          esac
+          echo "Contents of world-in:"
+          ls -la world-in
+
+      # Validates that a level.dat and .mca region files really arrived, counts the
+      # chunks out of the region files' own location tables, and writes the shard plan.
+      # A world that is not a world fails here with a message naming what it found.
+      - name: Plan the render
+        id: plan
+        run: |
+          node design/packages/render-actions/dist/cli.js plan \
+            --world world-in \
+            --dimension '${{ inputs.dimension }}' \
+            --map-id '${{ inputs.map-id }}' \
+            --out shard-plan.json \
+            --budget-minutes '${{ inputs.budget-minutes }}' \
+            --max-jobs '${{ inputs.max-jobs }}' \
+            ${{ inputs.force-shards != '' && format('--force-shards {0}', inputs.force-shards) || '' }} \
+            --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # Checked here, once, before any wave is dispatched or the (possibly large) world
+      # artifact is uploaded - failing at the plan step with the exact numbers, rather than
+      # a shard runner dying mid-render with a bare "no space left on device".
+      #
+      # `df` on THIS runner, not the published runner spec: this project has already caught
+      # that spec understating a real runner's free disk by a wide margin (see
+      # docs/world-sources.md), so trusting it here would make this check reject worlds a
+      # real runner could actually hold. ubuntu-24.04 hosted runners are provisioned from the same
+      # image, so this runner's disk - measured right after the same world fetch a shard
+      # runner would also do - stands in for what the wave jobs this same run dispatches
+      # will have.
+      - name: Check the runner has enough free disk for this plan
+        shell: bash
+        env:
+          REQUIRED_BYTES: ${{ steps.plan.outputs.required-disk-bytes }}
+        run: |
+          set -euo pipefail
+          free_bytes=$(df --output=avail -B1 . | tail -n1 | tr -d '[:space:]')
+          required_gib=$(( (REQUIRED_BYTES + 1073741823) / 1073741824 ))
+          free_gib=$(( free_bytes / 1073741824 ))
+          echo "Required (estimate, with safety margin): ~${required_gib} GiB free"
+          echo "Free on this runner right now:            ~${free_gib} GiB free"
+          if [ "$free_bytes" -lt "$REQUIRED_BYTES" ]; then
+            echo "::error::Not enough disk for this render: the plan needs roughly ${required_gib} GiB free on a job's runner (fetching the world, and separately a shard rendering it, each with a safety margin), and this runner has only ~${free_gib} GiB free. This runner shares its image with the wave jobs this run would dispatch, so they would very likely fail the same way partway through. Render fewer dimensions per run, trim the world, or dispatch this workflow on a runner with more disk."
+            exit 1
+          fi
+
+      # The world is uploaded once here rather than re-fetched by every shard, so a
+      # thirty-way split does not download the same archive thirty times from someone
+      # else's server.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: world
+          path: world-in
+          retention-days: 1
+          compression-level: 1
+
+      # Deliberately not named "shard-something": the merge job collects the shards with
+      # the pattern `shard-*`, and an artifact called shard-plan would be swept up with
+      # them and then fail as a shard with no map directory.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: render-plan
+          path: shard-plan.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------------
+  # The shards, in waves.
+  #
+  # One job per shard, each rendering its own slice into its own storage, so nothing is
+  # shared and nothing can race. A matrix holds at most 256 of them, so a plan needing
+  # more is split into waves that run one after another. RENDER_WAVE_SLOTS wave jobs are
+  # declared - twelve, right now - because Actions cannot generate a variable number of
+  # jobs; a plan needing more waves than that fails in the plan step, with the number it
+  # needs, rather than silently rendering part of the world.
+  #
+  # This count is not a number chosen once and left to drift: it exists as
+  # `RENDER_WAVE_SLOTS` in design/packages/render-actions/src/bluemap.ts, and
+  # design/packages/render-actions/src/resume/resume.test.ts reads this very file and
+  # fails if the declared wave jobs and that constant ever disagree. Raising the ceiling
+  # means raising `RENDER_WAVE_SLOTS` and adding the matching `waveN` blocks here; the test
+  # is what keeps that a requirement rather than a suggestion.
+  #
+  # Each wave is skipped when the plan has no shards for it, and each waits for the one
+  # before it. The body is in render-shard-wave.yml, including the caching and the
+  # completion markers that make a re-dispatch skip the shards that are already done.
+  # ---------------------------------------------------------------------------------
+  wave1:
+    name: Wave 1
+    needs: [cli, plan]
+    if: needs.plan.outputs.wave1-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 1
+      shards: ${{ needs.plan.outputs.wave1-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave2:
+    name: Wave 2
+    needs: [cli, plan, wave1]
+    if: needs.plan.outputs.wave2-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 2
+      shards: ${{ needs.plan.outputs.wave2-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave3:
+    name: Wave 3
+    needs: [cli, plan, wave2]
+    if: needs.plan.outputs.wave3-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 3
+      shards: ${{ needs.plan.outputs.wave3-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave4:
+    name: Wave 4
+    needs: [cli, plan, wave3]
+    if: needs.plan.outputs.wave4-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 4
+      shards: ${{ needs.plan.outputs.wave4-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave5:
+    name: Wave 5
+    needs: [cli, plan, wave4]
+    if: needs.plan.outputs.wave5-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 5
+      shards: ${{ needs.plan.outputs.wave5-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave6:
+    name: Wave 6
+    needs: [cli, plan, wave5]
+    if: needs.plan.outputs.wave6-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 6
+      shards: ${{ needs.plan.outputs.wave6-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave7:
+    name: Wave 7
+    needs: [cli, plan, wave6]
+    if: needs.plan.outputs.wave7-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 7
+      shards: ${{ needs.plan.outputs.wave7-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave8:
+    name: Wave 8
+    needs: [cli, plan, wave7]
+    if: needs.plan.outputs.wave8-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 8
+      shards: ${{ needs.plan.outputs.wave8-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave9:
+    name: Wave 9
+    needs: [cli, plan, wave8]
+    if: needs.plan.outputs.wave9-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 9
+      shards: ${{ needs.plan.outputs.wave9-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave10:
+    name: Wave 10
+    needs: [cli, plan, wave9]
+    if: needs.plan.outputs.wave10-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 10
+      shards: ${{ needs.plan.outputs.wave10-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave11:
+    name: Wave 11
+    needs: [cli, plan, wave10]
+    if: needs.plan.outputs.wave11-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 11
+      shards: ${{ needs.plan.outputs.wave11-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  wave12:
+    name: Wave 12
+    needs: [cli, plan, wave11]
+    if: needs.plan.outputs.wave12-needed == 'true'
+    uses: ./.github/workflows/render-shard-wave.yml
+    with:
+      wave: 12
+      shards: ${{ needs.plan.outputs.wave12-shards }}
+      # BlueMap's already-sanitized storage id (see the `plan` job's `map-id` output above),
+      # not the raw --map-id input: this is what every path inside render-shard-wave.yml
+      # ends up looking for on disk.
+      map-id: ${{ needs.plan.outputs.map-id }}
+      map-name: ${{ inputs.map-name }}
+      accept-download: ${{ vars.BLUEMAP_ACCEPT_DOWNLOAD == 'false' && '0' || '1' }}
+
+  # ---------------------------------------------------------------------------------
+  # Put the shards back together and prove nothing was lost, duplicated or corrupted.
+  #
+  # One job per merge group. For a world small enough to have a single group this is the
+  # whole merge and behaves exactly as it always did: one job, one complete map, one
+  # artifact, verified. For a larger world each group merges only its own share, so no
+  # runner ever holds the whole map, and a final job composites the lowres layers.
+  #
+  # It runs even for a single shard: the merge is then a no-op union, and running it
+  # anyway means the verification covers every render rather than only split ones.
+  # ---------------------------------------------------------------------------------
+  merge:
+    name: Merge group ${{ matrix.group }}
+    needs: [plan, wave1, wave2, wave3, wave4, wave5, wave6, wave7, wave8, wave9, wave10, wave11, wave12]
+    # `always()` because most runs skip most wave jobs, and a skipped `needs` would
+    # otherwise skip this too. The wave results are checked explicitly instead, so a
+    # failed wave still stops the merge rather than publishing a map with a hole in it.
+    if: >-
+      ${{ always()
+        && needs.plan.result == 'success'
+        && needs.wave1.result != 'failure' && needs.wave1.result != 'cancelled'
+        && needs.wave2.result != 'failure' && needs.wave2.result != 'cancelled'
+        && needs.wave3.result != 'failure' && needs.wave3.result != 'cancelled'
+        && needs.wave4.result != 'failure' && needs.wave4.result != 'cancelled'
+        && needs.wave5.result != 'failure' && needs.wave5.result != 'cancelled'
+        && needs.wave6.result != 'failure' && needs.wave6.result != 'cancelled'
+        && needs.wave7.result != 'failure' && needs.wave7.result != 'cancelled'
+        && needs.wave8.result != 'failure' && needs.wave8.result != 'cancelled'
+        && needs.wave9.result != 'failure' && needs.wave9.result != 'cancelled'
+        && needs.wave10.result != 'failure' && needs.wave10.result != 'cancelled'
+        && needs.wave11.result != 'failure' && needs.wave11.result != 'cancelled'
+        && needs.wave12.result != 'failure' && needs.wave12.result != 'cancelled' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.plan.outputs.group-ids) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: design/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: design
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the planner
+        working-directory: design
+        run: pnpm --filter "@worldlens/render-actions..." run build
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: render-plan
+
+      # Only this group's shards. A group runner holds its own share of the map and
+      # never the whole of it, which is what makes a 40 GB map mergeable on a runner
+      # with 14 GB of free disk.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: shard-g${{ matrix.group }}-*
+          path: shards
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: matrix.group == 0
+        with:
+          name: webapp
+          path: site
+
+      # Every shard in this group must carry a completion marker that agrees with its
+      # output. A shard without one was cut off, and merging it would publish truncated
+      # work as finished. The run stops here and says which shards to re-dispatch for.
+      - name: Which shards this group takes on
+        id: group
+        run: |
+          node design/packages/render-actions/dist/cli.js waves \
+            --plan shard-plan.json \
+            --group '${{ matrix.group }}' \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check every shard in this group actually finished
+        shell: bash
+        env:
+          GROUP_SHARDS: ${{ steps.group.outputs.group-shards }}
+        run: |
+          set -uo pipefail
+          unfinished=""
+          for shard in $(node -e 'process.stdout.write(JSON.parse(process.env.GROUP_SHARDS).join(" "))'); do
+            root="shards/shard-g${{ matrix.group }}-$shard"
+            report=$(node design/packages/render-actions/dist/cli.js resume-check \
+              --plan shard-plan.json \
+              --shard "$shard" \
+              --storage-root "$root" \
+              --map-id '${{ needs.plan.outputs.map-id }}' \
+              --summary "$GITHUB_STEP_SUMMARY")
+            if ! printf '%s' "$report" | node -e 'let d="";process.stdin.on("data",c=>{d+=c}).on("end",()=>{process.exit(JSON.parse(d).trusted?0:1)})'; then
+              unfinished="$unfinished $shard"
+            fi
+          done
+          if [ -n "$unfinished" ]; then
+            echo "::error::These shards did not finish and were not merged:$unfinished. Their render state is cached; re-dispatch this workflow with the same inputs to carry them on."
+            exit 1
+          fi
+
+      # Asserts every shard's textures.json is byte-identical before anything is copied.
+      # Tiles refer to textures by ordinal, so two shards that numbered their textures
+      # differently would produce a map that renders with the wrong textures and reports
+      # nothing wrong. See docs/render-in-actions.md.
+      #
+      # `--lod-count 1` on a group merge: its coarse lods would be averaged over pixels
+      # no shard in the group rendered, and the final lowres merge rebuilds them from the
+      # merged lod 1 anyway.
+      - name: Merge this group's shards
+        run: |
+          node design/packages/render-actions/dist/cli.js merge \
+            --shards shards \
+            --plan shard-plan.json \
+            --map-id '${{ needs.plan.outputs.map-id }}' \
+            --out "merged/${{ needs.plan.outputs.map-id }}" \
+            ${{ needs.plan.outputs.single-group == 'true' && ' ' || '--lod-count 1' }} \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # Only for a single-group render, where this job produced the complete map and the
+      # verification has every shard to compare against.
+      - name: Verify the merge
+        if: needs.plan.outputs.single-group == 'true'
+        id: verify
+        run: |
+          node design/packages/render-actions/dist/cli.js verify \
+            --plan shard-plan.json \
+            --shards shards \
+            --map-id '${{ needs.plan.outputs.map-id }}' \
+            --merged "merged/${{ needs.plan.outputs.map-id }}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # `site/maps/<id>` has to be named with BlueMap's own sanitized id, not the raw
+      # --map-id input: the webapp's settings.json (from the `webapp` artifact, written by
+      # BlueMap itself) lists the sanitized id in its "maps" array, and the viewer fetches
+      # tiles from `maps/<that id>/...`. Publishing under the raw hyphenated name here
+      # would 404 every tile despite a genuinely complete render. See issue #47.
+      - name: Assemble the complete map
+        if: needs.plan.outputs.single-group == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "site/maps"
+          rm -rf "site/maps/${{ needs.plan.outputs.map-id }}"
+          mv "merged/${{ needs.plan.outputs.map-id }}" "site/maps/${{ needs.plan.outputs.map-id }}"
+          {
+            echo "## Output"
+            echo ""
+            echo "The rendered map is attached to this run as the **rendered-map** artifact."
+            echo "Unzip it and serve the folder over http; opening \`index.html\` from the file"
+            echo "system will not work, because the webapp fetches its tiles."
+            if [ "${{ inputs.output }}" = "artifact-and-pages" ]; then
+              echo ""
+              echo "> [!WARNING]"
+              echo "> This run was started with **artifact-and-pages**, so the map is also being"
+              echo "> published to GitHub Pages. This repository publishes its documentation site"
+              echo "> to Pages at /map/, alongside the documentation site rather than over it."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.plan.outputs.single-group == 'true'
+        with:
+          name: rendered-map
+          path: site
+          retention-days: 30
+
+      # The documentation site and a rendered map both want to be "the Pages site".
+      # Publishing the map on its own would take the docs down, and somebody
+      # rendering a world has no reason to expect that. So the docs are rebuilt here
+      # and the map is placed underneath them at /map/, and both survive.
+      - name: Build the documentation site to publish alongside the map
+        if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+        working-directory: design
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm --filter @worldlens/site build
+          node packages/site/scripts/assert-base-path.mjs
+
+      # Pages serves the files that exist, under the names they have. The engine stores
+      # hires tiles gzipped as `0.prbm.gz`, and the viewer asks for `0.prbm` unless its
+      # settings.json says otherwise - so without this step every tile 404s and the
+      # published map loads to an empty sky, with a green run and a working link to
+      # show for it. Exits non-zero rather than publishing a site nobody can use.
+      - name: Make the map servable by a host that only serves files
+        if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+        run: |
+          set -euo pipefail
+          node design/packages/render-actions/dist/cli.js static-host \
+            --web-root site \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Combine the site and the map
+        if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf pages-root
+          cp -r design/packages/site/dist pages-root
+          if [ -d pages-root/map ]; then
+            echo "::error::the documentation site already publishes /map/; refusing to overwrite it"
+            exit 1
+          fi
+          mkdir -p pages-root/map
+          cp -r site/. pages-root/map/
+          echo "documentation site: $(find pages-root -maxdepth 1 -type f | wc -l) root files"
+          echo "rendered map:       $(find pages-root/map -type f | wc -l) files under /map/"
+
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+        with:
+          path: pages-root
+
+      # A multi-group render ships in parts. Hires tiles are disjoint across the whole
+      # plan, so this group's hires output is already its final share of the map and
+      # nothing downstream opens it again.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.plan.outputs.single-group != 'true'
+        with:
+          name: partial-hires-${{ matrix.group }}
+          path: merged/${{ needs.plan.outputs.map-id }}/tiles/0
+          retention-days: 30
+          compression-level: 1
+
+      # Lod 1 is not disjoint: a lowres tile is 500 blocks square on an unoffset grid and
+      # straddles group boundaries. Only this small part travels to the final job.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: needs.plan.outputs.single-group != 'true'
+        with:
+          name: partial-lowres-${{ matrix.group }}
+          path: |
+            merged/${{ needs.plan.outputs.map-id }}/tiles/1
+            merged/${{ needs.plan.outputs.map-id }}/settings.json
+            merged/${{ needs.plan.outputs.map-id }}/textures.json.gz
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------------
+  # The last level of a hierarchical merge, for a map too large to assemble on one
+  # runner. Reads only the lowres layers of each group's partial, composites lod 1
+  # across the group boundaries and rebuilds lod 2 upwards from the result. Megabytes
+  # rather than gigabytes, so this fits however large the world is.
+  # ---------------------------------------------------------------------------------
+  merge-lowres:
+    name: Merge the lowres pyramid
+    needs: [plan, merge]
+    if: needs.plan.outputs.single-group != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: design/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: design
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the planner
+        working-directory: design
+        run: pnpm --filter "@worldlens/render-actions..." run build
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: render-plan
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: partial-lowres-*
+          path: partials-raw
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: webapp
+          path: site
+
+      # The lowres artifacts hold the map directory's contents directly, so each is
+      # rearranged into the `<partial>/<sanitized mapId>` shape the merge expects - the
+      # `merge-lowres` command below resolves partial directories the same way `merge`
+      # resolves shard directories, under BlueMap's sanitized id (see cli.ts's
+      # resolvePartialDirectories and design/packages/render-actions/src/bluemap.ts's
+      # sanitizeMapId), so this arrangement has to use that same id or nothing is found.
+      - name: Arrange the partials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p partials
+          for dir in partials-raw/*/; do
+            name=$(basename "$dir")
+            mkdir -p "partials/$name/${{ needs.plan.outputs.map-id }}"
+            cp -r "$dir." "partials/$name/${{ needs.plan.outputs.map-id }}/"
+          done
+          ls -la partials
+
+      - name: Merge the lowres layers
+        run: |
+          node design/packages/render-actions/dist/cli.js merge-lowres \
+            --partials partials \
+            --plan shard-plan.json \
+            --map-id '${{ needs.plan.outputs.map-id }}' \
+            --out "site/maps/${{ needs.plan.outputs.map-id }}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Say where the map went
+        shell: bash
+        # GitHub's expression language has NO arithmetic operators - no `-`, no `+`. It
+        # only has comparison and logic. `fromJSON(x) - 1` is therefore a parse error, and
+        # a parse error anywhere in a workflow file stops the whole workflow from being
+        # registered: it vanishes from the Actions list, `gh workflow run` reports it as
+        # not found, and the only visible symptom is a zero-second "workflow file issue"
+        # failure hung on unrelated pushes. This file carried exactly that for its whole
+        # life, so `Render world` had never once been dispatchable.
+        #
+        # Bash does have arithmetic. The value crosses as an env var and the subtraction
+        # happens here, where a shell can actually do it.
+        env:
+          GROUP_COUNT: ${{ needs.plan.outputs.group-count }}
+        run: |
+          set -euo pipefail
+          last_group=$(( GROUP_COUNT - 1 ))
+          {
+            echo "## Output"
+            echo ""
+            echo "This world was too large for one runner to hold the merged map, so it ships"
+            echo "in parts:"
+            echo ""
+            echo "- **map-lowres**: the webapp, the map metadata and the whole lowres pyramid."
+            echo "- **partial-hires-0** to **partial-hires-${last_group}**: the hires tiles, one artifact per merge group."
+            echo ""
+            echo "Unzip **map-lowres**, then unzip each **partial-hires-N** into"
+            echo "\`maps/${{ needs.plan.outputs.map-id }}/tiles/0/\` inside it. The hires parts never overlap,"
+            echo "so the order does not matter. Serve the resulting folder over http; opening"
+            echo "\`index.html\` from the file system will not work, because the webapp fetches"
+            echo "its tiles."
+            echo ""
+            echo "> [!NOTE]"
+            echo "> Publishing to Pages is not attempted for a map of this size: it would need"
+            echo "> one runner to hold every part at once, which is the constraint this split"
+            echo "> exists to avoid."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: map-lowres
+          path: site
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------------
+  # Optional publish. Shares the `pages` concurrency group with the documentation
+  # workflow so the two deployments queue rather than race. The artifact carries the
+  # documentation site with the rendered map nested at /map/, so publishing a map
+  # never takes the docs offline.
+  #
+  # Only for a single-group render. A map large enough to ship in parts would need one
+  # runner to hold every part at once to publish it, which is the constraint the split
+  # exists to avoid; the merge-lowres summary says so rather than failing here.
+  # ---------------------------------------------------------------------------------
+  publish:
+    name: Publish to Pages
+    needs: [plan, merge]
+    if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

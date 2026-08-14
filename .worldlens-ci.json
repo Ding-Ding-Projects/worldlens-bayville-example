@@ -1,0 +1,16 @@
+{
+  "tool": "worldlens",
+  "version": 2,
+  "templateVersion": 1,
+  "files": [
+    ".github/workflows/render-world.yml",
+    ".github/workflows/render-shard-wave.yml",
+    ".github/workflows/scheduled-render.yml"
+  ],
+  "fileHashes": {
+    ".github/workflows/render-world.yml": "7ac8658d243c35a80fd8cebe179203c25a74658e19d5c893f1b15a25a2d9131e",
+    ".github/workflows/render-shard-wave.yml": "de45f4f5f51715ec26f0529663508e81070dcebd6205282610d2f3384d15e013",
+    ".github/workflows/scheduled-render.yml": "be1be6d09bbc0fc3be1d37a628797c787cf16a61028a5935b4b730856ae03c48"
+  },
+  "preparedAt": "2026-08-14T03:36:38.676Z"
+}
