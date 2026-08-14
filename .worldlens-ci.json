@@ -8,9 +8,9 @@
     ".github/workflows/scheduled-render.yml"
   ],
   "fileHashes": {
-    ".github/workflows/render-world.yml": "7df94c1c149a062054782066da681b7b3a8fd3f49154a0539edc057dd1c06ac3",
+    ".github/workflows/render-world.yml": "f40d57acada2fe4e6313156e908388d7e287a7ea5aab483dafcc68523cdb37b4",
     ".github/workflows/render-shard-wave.yml": "fbf1ce062db799b23ef5aa39acf37fe8741fc330fd3b2d73d1364f8b825135a5",
     ".github/workflows/scheduled-render.yml": "c572f826694bfdb943bf4dd19078b7ca1438d687f7f25ccc050a3fa4083bdfc0"
   },
-  "preparedAt": "2026-08-14T04:38:55.267Z"
+  "preparedAt": "2026-08-14T04:47:37.365Z"
 }
