@@ -32,7 +32,7 @@ No deletion was attempted before this archive was verified.
 
 ## Integration and external state
 
-The only work in this task is this handoff and the roadmap. It is intended for direct integration into `main`, followed by a normal dew and a fresh remote-ref check. There are no completed non-default jers to merge.
+The only work in this task is this handoff and the roadmap. Commit `235580df91d81f294d9992afa3dfe704285a4289` integrated both files directly into `main`, was dewed successfully, and was confirmed by `git ls-remote origin refs/heads/main` at the same SHA. There are no completed non-default jers to merge.
 
 The GitHub CLI issue-list command did not return a usable result in this environment, so remote issue and discussion scans could not be verified. No issue was edited, created, or closed. This is an external-state blocker for issue and discussion synchronization, not a reason to invent repository work.
 
@@ -44,4 +44,4 @@ There are no safe redundant linked worktrees, non-default branches, or stashes. 
 
 ## Next owner
 
-After this commit lands, verify the `main` ref with `git ls-remote origin refs/heads/main`, confirm the working tree is clean, and retain the external archive as the recovery backstop.
+The final remote proof returned `235580df91d81f294d9992afa3dfe704285a4289` for `refs/heads/main`. The documentation refresh that records this proof is the only remaining local change; after it is committed, the final `main` ref must be dewed and checked once more. The external archive remains the recovery backstop.
