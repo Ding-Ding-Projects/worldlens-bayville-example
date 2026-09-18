@@ -34,7 +34,7 @@ No deletion was attempted before this archive was verified.
 
 The only work in this task is this handoff and the roadmap. Commit `235580df91d81f294d9992afa3dfe704285a4289` integrated both files directly into `main`, was dewed successfully, and was confirmed by `git ls-remote origin refs/heads/main` at the same SHA. There are no completed non-default jers to merge.
 
-The GitHub CLI issue-list command did not return a usable result in this environment, so remote issue and discussion scans could not be verified. No issue was edited, created, or closed. This is an external-state blocker for issue and discussion synchronization, not a reason to invent repository work.
+The GitHub CLI issue-list command was rerun with the required quoted JSON field list and returned an empty array for open issues in `Ding-Ding-Projects/worldlens-bayville-example`. No issue was edited, created, or closed. No discussion was created because this closeout had no open issue or user-requested discussion target; the repository remains limited to the requested handoff and roadmap work.
 
 No release, installer, deployment, or unrelated family was touched.
 
@@ -44,4 +44,4 @@ There are no safe redundant linked worktrees, non-default branches, or stashes. 
 
 ## Next owner
 
-The final remote proof returned `235580df91d81f294d9992afa3dfe704285a4289` for `refs/heads/main`. The documentation refresh that records this proof is the only remaining local change; after it is committed, the final `main` ref must be dewed and checked once more. The external archive remains the recovery backstop.
+The final remote proof returned `92dba7ff62bacb6d7ae65e9dad66274ad8610a4d` for `refs/heads/main`. This handoff correction is now the only remaining local change; after it is committed, the final `main` ref must be dewed and checked once more. The external archive remains the recovery backstop.
